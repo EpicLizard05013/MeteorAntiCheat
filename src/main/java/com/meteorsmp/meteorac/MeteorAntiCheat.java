@@ -3,7 +3,9 @@ package com.meteorsmp.meteorac;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.block.Block;
+import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
@@ -11,6 +13,7 @@ import org.bukkit.event.block.Action;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityShootBowEvent;
 import org.bukkit.event.player.AsyncPlayerChatEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
@@ -24,21 +27,24 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
 
     private final String prefix = ChatColor.translateAlternateColorCodes('&', "&c[MeteorAntiCheat] &f");
 
-    // Data maps
-    private final Map<UUID, Integer> violationLevels = new HashMap<>();
+    // Violation Tracking & Cooldowns
+    private final Map<String, Map<UUID, Integer>> categoryViolations = new HashMap<>();
     private final Map<UUID, Long> chatCooldown = new HashMap<>();
     
-    // Heuristic maps
+    // Heuristic State Maps
     private final Map<UUID, LinkedList<Long>> clickDelays = new HashMap<>();
     private final Map<UUID, Long> lastClickTime = new HashMap<>();
     private final Map<UUID, Integer> movePackets = new HashMap<>();
     private final Map<UUID, Long> moveTime = new HashMap<>();
     private final Map<UUID, Long> bowDrawTime = new HashMap<>();
+    private final Map<UUID, Float> lastYaw = new HashMap<>();
+    private final Map<UUID, Float> lastPitch = new HashMap<>();
+    private final Map<UUID, Long> lastVelocityTime = new HashMap<>();
 
     @Override
     public void onEnable() {
         getServer().getPluginManager().registerEvents(this, this);
-        getLogger().info("[MeteorAntiCheat] Advanced Physics & Heuristics Engine v2.0 online.");
+        getLogger().info("[MeteorAntiCheat] Full Grim-Mapped Engine v3.0 online.");
     }
 
     @Override
@@ -46,48 +52,55 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
         getLogger().info("MeteorAntiCheat engine offline.");
     }
 
-    /* 
-     * 1. MOVEMENT & PHYSICS VERIFICATION
-     * Calculates real-time movement deltas to catch Speed, Fly, FastTick, and NoFall.
+    private boolean isBypassed(Player player) {
+        return player.hasPermission("meteor.admin") || player.isOp();
+    }
+
+    /*
+     * ==========================================
+     * 1. SIMULATION, GROUND SPOOF & TIMER CHECKS
+     * ==========================================
      */
     @EventHandler
     public void onMove(PlayerMoveEvent event) {
         Player player = event.getPlayer();
-        if (player.hasPermission("meteor.admin") || player.isOp() || player.isFlying() || player.isGliding()) return;
+        if (isBypassed(player) || player.isFlying() || player.isGliding()) return;
 
         Location from = event.getFrom();
         Location to = event.getTo();
         if (to == null || from.getWorld() == null || to.getWorld() == null) return;
 
-        // --- Speed Check ---
+        UUID uuid = player.getUniqueId();
+
+        // -- Simulation / Speed Check --
         double dXZ = Math.sqrt(Math.pow(to.getX() - from.getX(), 2) + Math.pow(to.getZ() - from.getZ(), 2));
         double dY = to.getY() - from.getY();
-        double maxMovementSpeed = 0.65 + (player.getPing() * 0.001); 
+        double maxSpeed = 0.65 + (player.getPing() * 0.001);
 
-        if (dXZ > maxMovementSpeed) {
-            event.setTo(from); // Rubberband the player
-            handleViolation(player, "Speed/Movement", 2, dXZ, dY, maxMovementSpeed, dXZ);
+        if (dXZ > maxSpeed) {
+            event.setTo(from);
+            handleViolation(player, "Simulation", "Speed", 2);
         }
 
-        // --- Fly/Hover Check ---
-        if (!player.getLocation().getBlock().getRelative(0, -1, 0).getType().isSolid()) {
-            if (dY >= 0.0 && event.getFrom().getY() > 0) {
-                if (player.getFallDistance() == 0) {
-                    handleViolation(player, "Fly/Hover", 3, dXZ, dY, 0.0, dY);
-                }
+        // -- GroundSpoof / NoFall Check --
+        if (player.isOnGround() && from.getY() > to.getY()) {
+            Block blockBelow = from.clone().subtract(0, 0.5, 0).getBlock();
+            if (blockBelow.getType().isAir() && player.getFallDistance() > 2.0f) {
+                handleViolation(player, "Simulation", "GroundSpoof", 3);
             }
         }
 
-        // --- Timer / Fast-Tick Check ---
-        UUID uuid = player.getUniqueId();
+        // -- Timer & TimerLimit Check --
         long now = System.currentTimeMillis();
         long start = moveTime.getOrDefault(uuid, now);
         int packets = movePackets.getOrDefault(uuid, 0) + 1;
 
-        if (now - start > 1000) { // Every 1 second
-            if (packets > 25 && !player.isInsideVehicle()) {
-                handleViolation(player, "Timer/FastTick", 4, 0.0, 0.0, 20.0, packets);
-                event.setTo(from); 
+        if (now - start > 1000) {
+            if (packets > 26 && !player.isInsideVehicle()) {
+                handleViolation(player, "Simulation", "Timer", 4);
+                event.setTo(from);
+            } else if (packets < 15 && packets > 0 && !player.isInsideVehicle()) {
+                handleViolation(player, "Simulation", "TimerLimit", 2);
             }
             moveTime.put(uuid, now);
             movePackets.put(uuid, 0);
@@ -95,72 +108,80 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
             movePackets.put(uuid, packets);
         }
 
-        // --- NoFall (Ground Spoof) Check ---
-        if (player.isOnGround() && from.getY() > to.getY()) {
-            Block blockBelow = from.clone().subtract(0, 0.5, 0).getBlock();
-            Block blockAt = from.getBlock();
-            
-            if (blockBelow.getType().isAir() && blockAt.getType().isAir() && player.getFallDistance() > 2.0f) {
-                handleViolation(player, "NoFall (Spoof)", 3, 0.0, 0.0, 0.0, player.getFallDistance());
-            }
+        // -- Baritone / Aim Snapping Heuristics --
+        float yawDelta = Math.abs(to.getYaw() - lastYaw.getOrDefault(uuid, to.getYaw()));
+        float pitchDelta = Math.abs(to.getPitch() - lastPitch.getOrDefault(uuid, to.getPitch()));
+        if (yawDelta > 60.0f && pitchDelta < 1.0f && dXZ > 0.2) {
+            handleViolation(player, "Combat", "Aim", 2); // Baritone linear pathfinding look snaps
+        }
+        lastYaw.put(uuid, to.getYaw());
+        lastPitch.put(uuid, to.getPitch());
+
+        // -- Misc: Vehicle & Elytra Checks --
+        if (player.isInsideVehicle() && dY > 1.5) {
+            handleViolation(player, "Misc", "Vehicle", 3);
         }
     }
 
     /*
-     * 2. COMBAT & KILLAURA HEURISTICS
-     * Uses Vector Dot Products to ensure attackers are actually looking at their victim.
+     * ==========================================
+     * 2. COMBAT, REACH, HITBOXES & KNOCKBACK
+     * ==========================================
      */
     @EventHandler
     public void onDamage(EntityDamageByEntityEvent event) {
-        if (!(event.getDamager() instanceof Player) || (!(event.getEntity() instanceof Player))) return;
-
+        if (!(event.getDamager() instanceof Player)) return;
         Player attacker = (Player) event.getDamager();
-        Player victim = (Player) event.getEntity();
+        if (isBypassed(attacker)) return;
 
-        if (attacker.hasPermission("meteor.admin") || attacker.isOp()) return;
+        // -- Reach & Hitboxes Check --
+        if (event.getEntity() instanceof Player) {
+            Player victim = (Player) event.getEntity();
+            double distance = attacker.getLocation().distance(victim.getLocation());
+            double maxReach = 3.1 + (attacker.getPing() + victim.getPing()) * 0.0025;
 
-        Location loc1 = attacker.getLocation();
-        Location loc2 = victim.getLocation();
-
-        // --- Reach Check ---
-        double distance = loc1.distance(loc2);
-        double maxReach = 3.1 + (attacker.getPing() + victim.getPing()) * 0.0025;
-
-        if (distance > maxReach) {
-            event.setCancelled(true);
-            handleViolation(attacker, "Reach", 3, distance, 0.0, maxReach, distance);
-            return;
+            if (distance > maxReach) {
+                event.setCancelled(true);
+                handleViolation(attacker, "Reach", "Reach", 3);
+            } else if (distance > 3.0 && Math.abs(attacker.getLocation().getY() - victim.getLocation().getY()) > 2.5) {
+                event.setCancelled(true);
+                handleViolation(attacker, "Hitboxes", "Hitboxes", 3);
+            }
         }
 
-        // --- KillAura (Angle) Check ---
-        Vector attackerDirection = loc1.getDirection().normalize();
-        Vector targetDirection = loc2.toVector().subtract(loc1.toVector()).normalize();
-        double angle = attackerDirection.dot(targetDirection);
+        // Track damage for Knockback / Explosion velocity validation
+        lastVelocityTime.put(attacker.getUniqueId(), System.currentTimeMillis());
+    }
 
-        if (angle < 0.75 && distance > 1.5) {
-            event.setCancelled(true);
-            handleViolation(attacker, "KillAura (Angle)", 4, 0.0, 0.0, 0.75, angle);
+    @EventHandler
+    public void onEntityDamage(EntityDamageEvent event) {
+        if (!(event.getEntity() instanceof Player)) return;
+        Player player = (Player) event.getEntity();
+        if (event.getCause() == EntityDamageEvent.DamageCause.ENTITY_EXPLOSION || event.getCause() == EntityDamageEvent.DamageCause.BLOCK_EXPLOSION) {
+            lastVelocityTime.put(player.getUniqueId(), System.currentTimeMillis());
         }
     }
 
     /*
-     * 3. INTERACTION & MACRO ANALYSIS
+     * ==========================================
+     * 3. MISC, NOSLOW, SPRINT, PLACE & BREAK
+     * ==========================================
      */
     @EventHandler
-    public void onClick(PlayerInteractEvent event) {
+    public void onInteract(PlayerInteractEvent event) {
         Player player = event.getPlayer();
         UUID uuid = player.getUniqueId();
-        
-        // --- FastBow Draw Tracking ---
-        if (event.getItem() != null && event.getItem().getType() == org.bukkit.Material.BOW) {
+
+        // Bow Draw Tracking for FastBow
+        if (event.getItem() != null && event.getItem().getType() == Material.BOW) {
             if (event.getAction() == Action.RIGHT_CLICK_AIR || event.getAction() == Action.RIGHT_CLICK_BLOCK) {
                 bowDrawTime.put(uuid, System.currentTimeMillis());
             }
         }
 
-        // --- Macro & CPS Standard Deviation ---
+        // -- Autoclicker Standard Deviation Check --
         if (event.getAction() == Action.LEFT_CLICK_AIR || event.getAction() == Action.LEFT_CLICK_BLOCK) {
-            if (player.hasPermission("meteor.admin") || player.isOp()) return;
+            if (isBypassed(player)) return;
 
             long now = System.currentTimeMillis();
             long last = lastClickTime.getOrDefault(uuid, now);
@@ -171,114 +192,112 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
                 delays.add(delay);
 
                 if (delays.size() >= 20) {
-                    double mean = delays.stream().mapToLong(val -> val).average().orElse(0.0);
-                    double variance = delays.stream().mapToDouble(val -> Math.pow(val - mean, 2)).average().orElse(0.0);
+                    double mean = delays.stream().mapToLong(v -> v).average().orElse(0.0);
+                    double variance = delays.stream().mapToDouble(v -> Math.pow(v - mean, 2)).average().orElse(0.0);
                     double stdDev = Math.sqrt(variance);
 
-                    if (stdDev < 5.0 && mean < 100.0) {
-                        handleViolation(player, "Macro/CPS Heuristics", 2, 0.0, 0.0, 5.0, stdDev);
+                    if (stdDev < 4.5 && mean < 90.0) {
+                        handleViolation(player, "Autoclicker", "Autoclicker", 3);
                     }
-                    delays.clear(); 
+                    delays.clear();
                 }
                 clickDelays.put(uuid, delays);
             }
             lastClickTime.put(uuid, now);
         }
-    }
 
-    /*
-     * 4. FASTBOW / INSTANT-SHOOT
-     */
-    @EventHandler
-    public void onBowShoot(EntityShootBowEvent event) {
-        if (!(event.getEntity() instanceof Player)) return;
-        Player player = (Player) event.getEntity();
-        
-        if (player.hasPermission("meteor.admin") || player.isOp()) return;
-
-        long drawStart = bowDrawTime.getOrDefault(player.getUniqueId(), 0L);
-        long drawDuration = System.currentTimeMillis() - drawStart;
-        float force = event.getForce(); 
-
-        if (force >= 0.95f && drawDuration < 300 && drawStart != 0) {
-            event.setCancelled(true);
-            handleViolation(player, "FastBow", 4, 0.0, 0.0, 1000.0, drawDuration);
+        // -- NoSlow Check (Eating/Blocking while sprinting) --
+        if (player.isSprinting() && player.isHandRaised()) {
+            handleViolation(player, "Misc", "NoSlow", 2);
         }
     }
 
-    /*
-     * 5. BLOCK LINE OF SIGHT (NUKER / FASTPLACE)
-     */
     @EventHandler
     public void onBlockBreak(BlockBreakEvent event) {
         Player player = event.getPlayer();
-        if (player.hasPermission("meteor.admin") || player.isOp()) return;
+        if (isBypassed(player)) return;
 
-        Block targetBlock = player.getTargetBlockExact(6);
-        if (targetBlock == null || !targetBlock.getLocation().equals(event.getBlock().getLocation())) {
+        Block target = player.getTargetBlockExact(6);
+        if (target == null || !target.getLocation().equals(event.getBlock().getLocation())) {
             event.setCancelled(true);
-            handleViolation(player, "Nuker/WallBreak", 2, 0.0, 0.0, 1.0, 0.0);
+            handleViolation(player, "Misc", "Break", 2); // Nuker/WallBreak
         }
     }
 
     @EventHandler
     public void onBlockPlace(BlockPlaceEvent event) {
         Player player = event.getPlayer();
-        if (player.hasPermission("meteor.admin") || player.isOp()) return;
+        if (isBypassed(player)) return;
 
-        Block targetBlock = player.getTargetBlockExact(6);
-        if (targetBlock == null || player.getLocation().distance(event.getBlock().getLocation()) > 6.0) {
+        Block target = player.getTargetBlockExact(6);
+        if (target == null || player.getLocation().distance(event.getBlock().getLocation()) > 6.0) {
             event.setCancelled(true);
-            handleViolation(player, "FastPlace/Scaffold", 2, 0.0, 0.0, 6.0, player.getLocation().distance(event.getBlock().getLocation()));
+            handleViolation(player, "Misc", "Place", 2); // Scaffold / FastPlace
+        }
+    }
+
+    @EventHandler
+    public void onBowShoot(EntityShootBowEvent event) {
+        if (!(event.getEntity() instanceof Player)) return;
+        Player player = (Player) event.getEntity();
+        if (isBypassed(player)) return;
+
+        long drawStart = bowDrawTime.getOrDefault(player.getUniqueId(), 0L);
+        long duration = System.currentTimeMillis() - drawStart;
+
+        if (event.getForce() >= 0.95f && duration < 250 && drawStart != 0) {
+            event.setCancelled(true);
+            handleViolation(player, "BadPackets", "PacketOrder", 3);
         }
     }
 
     /*
-     * 6. PACKET RATE LIMITING (Exploit Prevention)
+     * ==========================================
+     * 4. BAD PACKETS, CHAT & EXPLOITS
+     * ==========================================
      */
     @EventHandler
     public void onChat(AsyncPlayerChatEvent event) {
         Player player = event.getPlayer();
-        if (player.hasPermission("meteor.admin") || player.isOp()) return;
+        if (isBypassed(player)) return;
 
         UUID uuid = player.getUniqueId();
         long now = System.currentTimeMillis();
 
-        if (chatCooldown.containsKey(uuid)) {
-            if (now - chatCooldown.get(uuid) < 1500) {
-                event.setCancelled(true);
-                player.sendMessage(prefix + ChatColor.RED + "Packet rate limit exceeded.");
-                return;
-            }
+        if (chatCooldown.containsKey(uuid) && now - chatCooldown.get(uuid) < 1200) {
+            event.setCancelled(true);
+            handleViolation(player, "Misc", "Chat", 1);
+            player.sendMessage(prefix + ChatColor.RED + "Chat packet rate limit exceeded.");
+            return;
         }
         chatCooldown.put(uuid, now);
     }
 
     /*
-     * 7. TELEMETRY & ALERT DISPATCHER
+     * ==========================================
+     * 5. CENTRALIZED PUNISHMENT & ALERT ENGINE
+     * ==========================================
      */
-    private void handleViolation(Player player, String module, int vlIncrease, double dXz, double dY, double expected, double observed) {
+    private void handleViolation(Player player, String category, String checkName, int vlAdd) {
         UUID uuid = player.getUniqueId();
-        int currentVl = violationLevels.getOrDefault(uuid, 0) + vlIncrease;
-        violationLevels.put(uuid, currentVl);
+        Map<UUID, Integer> catMap = categoryViolations.computeIfAbsent(category, k -> new HashMap<>());
+        int totalVL = catMap.getOrDefault(uuid, 0) + vlAdd;
+        catMap.put(uuid, totalVL);
 
+        // Action routing modeled after Grim's config commands
         String action = "ALERT";
-        if (currentVl >= 20) {
+        if (totalVL >= 40) {
             action = "BAN";
-            Bukkit.getScheduler().runTask(this, () -> player.kickPlayer("Violated security protocol: " + module));
-            violationLevels.put(uuid, 0); 
-        } else if (currentVl >= 5) {
-            action = "ALERT";
+            Bukkit.getScheduler().runTask(this, () -> player.kickPlayer("Security Violation: " + checkName));
+            catMap.put(uuid, 0); // Reset after action
         }
 
-        // JSON Logging
-        String jsonLog = String.format(
-            "{\n  \"engine\": \"MeteorAntiCheat\",\n  \"player\": \"%s\",\n  \"module\": \"%s\",\n  \"current_vl\": %d,\n  \"telemetry\": {\n    \"expected\": %.2f,\n    \"observed\": %.2f\n  },\n  \"action\": \"%s\"\n}",
-            player.getName(), module, currentVl, expected, observed, action
-        );
-        Bukkit.getConsoleSender().sendMessage(jsonLog);
+        // Console JSON Telemetry Logging
+        String log = String.format("{\"category\": \"%s\", \"check\": \"%s\", \"player\": \"%s\", \"vl\": %d, \"action\": \"%s\"}",
+                category, checkName, player.getName(), totalVL, action);
+        Bukkit.getConsoleSender().sendMessage(prefix + ChatColor.DARK_GRAY + log);
 
-        // Staff Broadcasts Loop (Updated with Meteor ranks)
+        // Broadcast to Staff Ranks and OPs
         for (Player admin : Bukkit.getOnlinePlayers()) {
             if (admin.isOp() || 
                 admin.hasPermission("meteor.mod") || 
@@ -287,7 +306,7 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
                 admin.hasPermission("meteor.owner") || 
                 admin.hasPermission("meteor.coowner")) {
                 
-                admin.sendMessage(prefix + ChatColor.RED + player.getName() + " flagged for " + module + " (VL: " + currentVl + ")");
+                admin.sendMessage(prefix + ChatColor.RED + player.getName() + " failed " + checkName + " [" + category + "] (VL: " + totalVL + ")");
             }
         }
     }
