@@ -20,14 +20,17 @@ import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.InventoryOpenEvent;
 import org.bukkit.event.player.AsyncPlayerChatEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerVelocityEvent;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.plugin.messaging.PluginMessageListener;
 import org.bukkit.util.Vector;
 
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 
-public final class MeteorAntiCheat extends JavaPlugin implements Listener {
+public final class MeteorAntiCheat extends JavaPlugin implements Listener, PluginMessageListener {
 
     private final String prefix = ChatColor.translateAlternateColorCodes('&', "&c[MeteorAntiCheat] &f");
 
@@ -43,21 +46,34 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
     private final Map<UUID, Long> bowDrawTime = new HashMap<>();
     private final Map<UUID, Float> lastYaw = new HashMap<>();
     private final Map<UUID, Float> lastPitch = new HashMap<>();
+    private final Map<UUID, Integer> aimBuffer = new HashMap<>();
     
-    // New Advanced State Trackers
+    // Advanced State & Client Trackers
     private final Set<UUID> openInventories = new HashSet<>();
     private final Map<UUID, Vector> expectedVelocity = new HashMap<>();
     private final Map<UUID, Long> velocityTime = new HashMap<>();
     private final Map<UUID, Long> totemPopTime = new HashMap<>();
+    private final Map<UUID, String> playerClientBrands = new HashMap<>();
 
     @Override
     public void onEnable() {
         getServer().getPluginManager().registerEvents(this, this);
-        getLogger().info("[MeteorAntiCheat] Enterprise Engine v4.0 (Full Protection) online.");
+        
+        // Register Plugin Messaging Channels for Client Brand Detection
+        getServer().getMessenger().registerIncomingPluginChannel(this, "minecraft:brand", this);
+        try {
+            getServer().getMessenger().registerIncomingPluginChannel(this, "MC|Brand", this);
+        } catch (Exception ignored) {}
+
+        getLogger().info("[MeteorAntiCheat] Enterprise Engine v4.2 (Client Detector Enabled) online.");
     }
 
     @Override
     public void onDisable() {
+        getServer().getMessenger().unregisterIncomingPluginChannel(this, "minecraft:brand");
+        try {
+            getServer().getMessenger().unregisterIncomingPluginChannel(this, "MC|Brand");
+        } catch (Exception ignored) {}
         getLogger().info("MeteorAntiCheat engine offline.");
     }
 
@@ -67,7 +83,42 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
 
     /*
      * ==========================================
-     * 1. MOVEMENT, SIMULATION & WORLD EXPLOITS
+     * 1. CLIENT BRAND DETECTOR LISTENER
+     * ==========================================
+     */
+    @Override
+    public void onPluginMessageReceived(String channel, Player player, byte[] message) {
+        if (!channel.equals("minecraft:brand") && !channel.equals("MC|Brand")) return;
+
+        try {
+            String brand;
+            // Minecraft brand payloads encode string length as the first byte
+            if (message.length > 0) {
+                brand = new String(message, 1, message.length - 1, StandardCharsets.UTF_8);
+            } else {
+                brand = new String(message, StandardCharsets.UTF_8);
+            }
+
+            playerClientBrands.put(player.getUniqueId(), brand);
+
+            String log = String.format("{\"category\": \"System\", \"check\": \"ClientBrand\", \"player\": \"%s\", \"brand\": \"%s\"}",
+                    player.getName(), brand);
+            getLogger().info(log);
+
+            // Broadcast to online staff if desired
+            for (Player admin : Bukkit.getOnlinePlayers()) {
+                if (admin.hasPermission("meteor.admin") || admin.hasPermission("meteor.mod") || admin.isOp()) {
+                    admin.sendMessage(prefix + ChatColor.YELLOW + player.getName() + " connected using client: " + ChatColor.WHITE + brand);
+                }
+            }
+        } catch (Exception e) {
+            playerClientBrands.put(player.getUniqueId(), "Unknown");
+        }
+    }
+
+    /*
+     * ==========================================
+     * 2. MOVEMENT, SIMULATION & WORLD EXPLOITS
      * ==========================================
      */
     @EventHandler
@@ -102,7 +153,6 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
         Material belowMat = from.clone().subtract(0, 0.1, 0).getBlock().getType();
         Material atMat = from.getBlock().getType();
         if ((belowMat == Material.WATER || belowMat == Material.LAVA) && atMat == Material.AIR) {
-            // If they are hovering perfectly on top of water without swimming/boating
             if (dY == 0.0 && !player.isInsideVehicle() && !player.isSwimming()) {
                 handleViolation(player, "Movement", "Jesus", 3);
             }
@@ -111,7 +161,7 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
         // -- InventoryMove Check --
         if (openInventories.contains(uuid) && dXZ > 0.15 && player.getFallDistance() == 0 && !player.isInsideVehicle()) {
             handleViolation(player, "Exploit", "InventoryMove", 2);
-            event.setTo(from); // Stop them from walking
+            event.setTo(from);
         }
 
         // -- Timer & TimerLimit --
@@ -137,29 +187,41 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
             long timeSinceVel = System.currentTimeMillis() - velocityTime.getOrDefault(uuid, 0L);
             if (timeSinceVel < 500) {
                 Vector expected = expectedVelocity.get(uuid);
-                // If the server pushed them UP, but their client claims they didn't go up and stayed on the ground
                 if (expected.getY() > 0.1 && dY <= 0 && player.isOnGround()) {
                     handleViolation(player, "Combat", "Velocity", 3);
                     expectedVelocity.remove(uuid);
                 }
             } else {
-                expectedVelocity.remove(uuid); // Expire old velocity data
+                expectedVelocity.remove(uuid);
             }
         }
 
-        // -- Baritone / Aim Snapping Heuristics --
+        // -- Baritone / Aim Snapping Heuristics (Buffered) --
         float yawDelta = Math.abs(to.getYaw() - lastYaw.getOrDefault(uuid, to.getYaw()));
         float pitchDelta = Math.abs(to.getPitch() - lastPitch.getOrDefault(uuid, to.getPitch()));
-        if (yawDelta > 60.0f && pitchDelta < 1.0f && dXZ > 0.2) {
-            handleViolation(player, "Combat", "Aim", 2);
+        
+        if (yawDelta > 180.0f) yawDelta = 360.0f - yawDelta;
+
+        if (yawDelta > 120.0f && pitchDelta < 0.5f && dXZ > 0.2) {
+            int buffer = aimBuffer.getOrDefault(uuid, 0) + 1;
+            aimBuffer.put(uuid, buffer);
+            
+            if (buffer >= 3) {
+                handleViolation(player, "Combat", "Aim", 1);
+                aimBuffer.put(uuid, 0);
+            }
+        } else {
+            int buffer = aimBuffer.getOrDefault(uuid, 0);
+            if (buffer > 0) aimBuffer.put(uuid, buffer - 1);
         }
+
         lastYaw.put(uuid, to.getYaw());
         lastPitch.put(uuid, to.getPitch());
     }
 
     /*
      * ==========================================
-     * 2. COMBAT, KNOCKBACK & EXPLOITS
+     * 3. COMBAT, KNOCKBACK & EXPLOITS
      * ==========================================
      */
     @EventHandler
@@ -167,7 +229,6 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
         Player player = event.getPlayer();
         if (isBypassed(player)) return;
         
-        // Log the velocity the server is TRYING to apply to the player
         if (event.getVelocity().lengthSquared() > 0.1) {
             expectedVelocity.put(player.getUniqueId(), event.getVelocity());
             velocityTime.put(player.getUniqueId(), System.currentTimeMillis());
@@ -187,7 +248,6 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
         Player attacker = (Player) event.getDamager();
         if (isBypassed(attacker)) return;
 
-        // -- Reach & Hitboxes --
         if (event.getEntity() instanceof Player) {
             Player victim = (Player) event.getEntity();
             double distance = attacker.getLocation().distance(victim.getLocation());
@@ -205,7 +265,7 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
 
     /*
      * ==========================================
-     * 3. INVENTORY & PLAYER EXPLOITS
+     * 4. INVENTORY & PLAYER EXPLOITS
      * ==========================================
      */
     @EventHandler
@@ -224,8 +284,6 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
         Player player = (Player) event.getWhoClicked();
         if (isBypassed(player)) return;
 
-        // -- AutoTotem Heuristic --
-        // If they click a totem within 50 milliseconds of popping one, it is a macro.
         if (event.getCurrentItem() != null && event.getCurrentItem().getType() == Material.TOTEM_OF_UNDYING) {
             long timeSincePop = System.currentTimeMillis() - totemPopTime.getOrDefault(player.getUniqueId(), 0L);
             if (timeSincePop > 0 && timeSincePop < 50) {
@@ -246,7 +304,6 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
             }
         }
 
-        // -- Autoclicker --
         if (event.getAction() == Action.LEFT_CLICK_AIR || event.getAction() == Action.LEFT_CLICK_BLOCK) {
             if (isBypassed(player)) return;
 
@@ -273,7 +330,6 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
             lastClickTime.put(uuid, now);
         }
 
-        // -- NoSlow Check --
         if (player.isSprinting() && player.isHandRaised()) {
             handleViolation(player, "Movement", "NoSlow", 2);
         }
@@ -296,7 +352,7 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
 
     /*
      * ==========================================
-     * 4. PUNISHMENT ROUTING
+     * 5. PUNISHMENT ROUTING
      * ==========================================
      */
     private void handleViolation(Player player, String category, String checkName, int vlAdd) {
