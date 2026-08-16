@@ -5,20 +5,19 @@ import org.bukkit.ChatColor;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.block.Block;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandExecutor;
+import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
-import org.bukkit.event.block.BlockBreakEvent;
-import org.bukkit.event.block.BlockPlaceEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
-import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityResurrectEvent;
 import org.bukkit.event.entity.EntityShootBowEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.InventoryOpenEvent;
-import org.bukkit.event.player.AsyncPlayerChatEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
@@ -30,13 +29,13 @@ import org.bukkit.util.Vector;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 
-public final class MeteorAntiCheat extends JavaPlugin implements Listener, PluginMessageListener {
+public final class MeteorAntiCheat extends JavaPlugin implements Listener, PluginMessageListener, CommandExecutor {
 
     private final String prefix = ChatColor.translateAlternateColorCodes('&', "&c[MeteorAntiCheat] &f");
 
     // Violation Tracking & Cooldowns
     private final Map<String, Map<UUID, Integer>> categoryViolations = new HashMap<>();
-    private final Map<UUID, Long> chatCooldown = new HashMap<>();
+    private final Map<UUID, String> playerNameCache = new HashMap<>();
     
     // Heuristic State Maps
     private final Map<UUID, LinkedList<Long>> clickDelays = new HashMap<>();
@@ -55,9 +54,22 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
     private final Map<UUID, Long> totemPopTime = new HashMap<>();
     private final Map<UUID, String> playerClientBrands = new HashMap<>();
 
+    // Auto Anchor Heuristics
+    private final Map<UUID, Long> lastAnchorInteractTime = new HashMap<>();
+    private final Map<UUID, Integer> anchorActionBuffer = new HashMap<>();
+
+    // Control States
+    private boolean testingMode = false;
+    private final Set<UUID> alertRecipients = new HashSet<>();
+
     @Override
     public void onEnable() {
         getServer().getPluginManager().registerEvents(this, this);
+        
+        // Register Command Executor
+        if (getCommand("meteorac") != null) {
+            getCommand("meteorac").setExecutor(this);
+        }
         
         // Register Plugin Messaging Channels for Client Brand Detection
         getServer().getMessenger().registerIncomingPluginChannel(this, "minecraft:brand", this);
@@ -65,7 +77,7 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
             getServer().getMessenger().registerIncomingPluginChannel(this, "MC|Brand", this);
         } catch (Exception ignored) {}
 
-        getLogger().info("[MeteorAntiCheat] Enterprise Engine v4.2 (Client Detector Enabled) online.");
+        getLogger().info("[MeteorAntiCheat] Enterprise Engine v4.4 (AutoAnchor & Alert System Enabled) online.");
     }
 
     @Override
@@ -78,12 +90,105 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
     }
 
     private boolean isBypassed(Player player) {
-        return player.hasPermission("meteor.admin") || player.isOp();
+        // If testing mode is active, owner bypasses, but opped staff / srmod can test checks.
+        if (testingMode && (player.isOp() || player.hasPermission("meteor.srmod"))) {
+            return false;
+        }
+        return player.hasPermission("meteor.bypass") || player.hasPermission("meteor.owner");
+    }
+
+    @EventHandler
+    public void onPlayerJoin(PlayerJoinEvent event) {
+        playerNameCache.put(event.getPlayer().getUniqueId(), event.getPlayer().getName());
     }
 
     /*
      * ==========================================
-     * 1. CLIENT BRAND DETECTOR LISTENER
+     * 1. COMMAND EXECUTOR (/meteorac)
+     * ==========================================
+     */
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (!label.equalsIgnoreCase("meteorac")) return false;
+
+        if (!sender.hasPermission("meteor.admin") && !sender.isOp()) {
+            sender.sendMessage(prefix + ChatColor.RED + "You do not have permission to use this command.");
+            return true;
+        }
+
+        if (args.length == 0) {
+            sender.sendMessage(prefix + ChatColor.YELLOW + "Subcommands:");
+            sender.sendMessage(ChatColor.WHITE + "/meteorac perms <player> - Toggle alert subscriptions for a player");
+            sender.sendMessage(ChatColor.WHITE + "/meteorac test - Toggle global anti-cheat testing mode");
+            sender.sendMessage(ChatColor.WHITE + "/meteorac logs <player> - View active violation records");
+            return true;
+        }
+
+        if (args[0].equalsIgnoreCase("test")) {
+            testingMode = !testingMode;
+            sender.sendMessage(prefix + ChatColor.YELLOW + "Testing Mode is now: " + (testingMode ? ChatColor.GREEN + "ENABLED (Staff can be flagged)" : ChatColor.RED + "DISABLED"));
+            return true;
+        }
+
+        if (args[0].equalsIgnoreCase("perms")) {
+            if (args.length < 2) {
+                sender.sendMessage(prefix + ChatColor.RED + "Usage: /meteorac perms <player>");
+                return true;
+            }
+            Player target = Bukkit.getPlayer(args[1]);
+            if (target == null) {
+                sender.sendMessage(prefix + ChatColor.RED + "Player not found online!");
+                return true;
+            }
+
+            UUID targetUuid = target.getUniqueId();
+            if (alertRecipients.contains(targetUuid)) {
+                alertRecipients.remove(targetUuid);
+                sender.sendMessage(prefix + ChatColor.YELLOW + target.getName() + " will no longer receive anti-cheat alerts.");
+                target.sendMessage(prefix + ChatColor.RED + "You have been removed from anti-cheat alerts.");
+            } else {
+                alertRecipients.add(targetUuid);
+                sender.sendMessage(prefix + ChatColor.GREEN + target.getName() + " will now receive anti-cheat alerts!");
+                target.sendMessage(prefix + ChatColor.GREEN + "You have been added to anti-cheat alerts.");
+            }
+            return true;
+        }
+
+        if (args[0].equalsIgnoreCase("logs")) {
+            if (args.length < 2) {
+                sender.sendMessage(prefix + ChatColor.RED + "Usage: /meteorac logs <player>");
+                return true;
+            }
+            String targetName = args[1];
+            sender.sendMessage(prefix + ChatColor.YELLOW + "--- Violation Logs for " + targetName + " ---");
+
+            boolean found = false;
+            for (Map.Entry<String, Map<UUID, Integer>> entry : categoryViolations.entrySet()) {
+                String category = entry.getKey();
+                for (Map.Entry<UUID, Integer> playerEntry : entry.getValue().entrySet()) {
+                    UUID uuid = playerEntry.getKey();
+                    String cachedName = playerNameCache.get(uuid);
+                    if (cachedName != null && cachedName.equalsIgnoreCase(targetName)) {
+                        int vl = playerEntry.getValue();
+                        sender.sendMessage(ChatColor.WHITE + "Category [" + ChatColor.YELLOW + category + ChatColor.WHITE + "] Total VL: " + ChatColor.RED + vl);
+                        found = true;
+                    }
+                }
+            }
+
+            if (!found) {
+                sender.sendMessage(ChatColor.GRAY + "No recorded violations found for this player.");
+            }
+            return true;
+        }
+
+        sender.sendMessage(prefix + ChatColor.RED + "Unknown subcommand. Type /meteorac for help.");
+        return true;
+    }
+
+    /*
+     * ==========================================
+     * 2. CLIENT BRAND DETECTOR LISTENER
      * ==========================================
      */
     @Override
@@ -92,7 +197,6 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
 
         try {
             String brand;
-            // Minecraft brand payloads encode string length as the first byte
             if (message.length > 0) {
                 brand = new String(message, 1, message.length - 1, StandardCharsets.UTF_8);
             } else {
@@ -100,14 +204,14 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
             }
 
             playerClientBrands.put(player.getUniqueId(), brand);
+            playerNameCache.put(player.getUniqueId(), player.getName());
 
             String log = String.format("{\"category\": \"System\", \"check\": \"ClientBrand\", \"player\": \"%s\", \"brand\": \"%s\"}",
                     player.getName(), brand);
             getLogger().info(log);
 
-            // Broadcast to online staff if desired
             for (Player admin : Bukkit.getOnlinePlayers()) {
-                if (admin.hasPermission("meteor.admin") || admin.hasPermission("meteor.mod") || admin.isOp()) {
+                if (alertRecipients.contains(admin.getUniqueId()) || admin.hasPermission("meteor.admin") || admin.hasPermission("meteor.mod") || admin.isOp()) {
                     admin.sendMessage(prefix + ChatColor.YELLOW + player.getName() + " connected using client: " + ChatColor.WHITE + brand);
                 }
             }
@@ -118,7 +222,7 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
 
     /*
      * ==========================================
-     * 2. MOVEMENT, SIMULATION & WORLD EXPLOITS
+     * 3. MOVEMENT, SIMULATION & WORLD EXPLOITS
      * ==========================================
      */
     @EventHandler
@@ -131,6 +235,8 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
         if (to == null || from.getWorld() == null || to.getWorld() == null) return;
 
         UUID uuid = player.getUniqueId();
+        playerNameCache.put(uuid, player.getName());
+        
         double dXZ = Math.sqrt(Math.pow(to.getX() - from.getX(), 2) + Math.pow(to.getZ() - from.getZ(), 2));
         double dY = to.getY() - from.getY();
         double maxSpeed = 0.65 + (player.getPing() * 0.001);
@@ -221,7 +327,7 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
 
     /*
      * ==========================================
-     * 3. COMBAT, KNOCKBACK & EXPLOITS
+     * 4. COMBAT, KNOCKBACK & EXPLOITS
      * ==========================================
      */
     @EventHandler
@@ -265,7 +371,7 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
 
     /*
      * ==========================================
-     * 4. INVENTORY & PLAYER EXPLOITS
+     * 5. INVENTORY & PLAYER EXPLOITS
      * ==========================================
      */
     @EventHandler
@@ -297,6 +403,29 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
     public void onInteract(PlayerInteractEvent event) {
         Player player = event.getPlayer();
         UUID uuid = player.getUniqueId();
+        playerNameCache.put(uuid, player.getName());
+
+        // -- Auto Anchor Exploit Check --
+        if (event.getClickedBlock() != null && event.getClickedBlock().getType() == Material.RESPAWN_ANCHOR) {
+            if (!isBypassed(player)) {
+                long now = System.currentTimeMillis();
+                long last = lastAnchorInteractTime.getOrDefault(uuid, 0L);
+                long diff = now - last;
+
+                if (diff > 0 && diff < 85) {
+                    int buffer = anchorActionBuffer.getOrDefault(uuid, 0) + 1;
+                    anchorActionBuffer.put(uuid, buffer);
+                    if (buffer >= 3) {
+                        event.setCancelled(true);
+                        handleViolation(player, "Exploit", "AutoAnchor", 4);
+                        anchorActionBuffer.put(uuid, 0);
+                    }
+                } else {
+                    anchorActionBuffer.put(uuid, Math.max(0, anchorActionBuffer.getOrDefault(uuid, 0) - 1));
+                }
+                lastAnchorInteractTime.put(uuid, now);
+            }
+        }
 
         if (event.getItem() != null && event.getItem().getType() == Material.BOW) {
             if (event.getAction() == Action.RIGHT_CLICK_AIR || event.getAction() == Action.RIGHT_CLICK_BLOCK) {
@@ -352,11 +481,13 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
 
     /*
      * ==========================================
-     * 5. PUNISHMENT ROUTING
+     * 6. PUNISHMENT ROUTING
      * ==========================================
      */
     private void handleViolation(Player player, String category, String checkName, int vlAdd) {
         UUID uuid = player.getUniqueId();
+        playerNameCache.put(uuid, player.getName());
+        
         Map<UUID, Integer> catMap = categoryViolations.computeIfAbsent(category, k -> new HashMap<>());
         int totalVL = catMap.getOrDefault(uuid, 0) + vlAdd;
         catMap.put(uuid, totalVL);
@@ -373,13 +504,10 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
         Bukkit.getConsoleSender().sendMessage(prefix + ChatColor.DARK_GRAY + log);
 
         for (Player admin : Bukkit.getOnlinePlayers()) {
-            if (admin.isOp() || 
-                admin.hasPermission("meteor.mod") || 
-                admin.hasPermission("meteor.srmod") || 
-                admin.hasPermission("meteor.admin") || 
-                admin.hasPermission("meteor.owner") || 
-                admin.hasPermission("meteor.coowner")) {
-                
+            boolean isStaff = admin.isOp() || admin.hasPermission("meteor.mod") || admin.hasPermission("meteor.srmod") || admin.hasPermission("meteor.admin") || admin.hasPermission("meteor.owner");
+            boolean isSubscribed = alertRecipients.contains(admin.getUniqueId());
+
+            if (isStaff || isSubscribed) {
                 admin.sendMessage(prefix + ChatColor.RED + player.getName() + " failed " + checkName + " [" + category + "] (VL: " + totalVL + ")");
             }
         }
