@@ -1,0 +1,11 @@
+name: MeteorAntiCheat
+version: 1.21.11-1.0
+main: com.meteorsmp.meteorac.MeteorAntiCheat
+api-version: '1.21'
+commands:
+  meteorac:
+    description: MeteorAntiCheat engine main command
+    permission: meteor.admin
+permissions:
+  meteor.admin:
+    default: op
