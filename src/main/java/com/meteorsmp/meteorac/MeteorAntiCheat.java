@@ -79,9 +79,10 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
 
     @EventHandler
     public void onDamage(EntityDamageByEntityEvent event) {
-        if (!(event.getAttacker() instanceof Player) || !(event.getEntity() instanceof Player)) return;
+        // FIXED: Changed getAttacker() to getDamager()
+        if (!(event.getDamager() instanceof Player) || !(event.getEntity() instanceof Player)) return;
 
-        Player attacker = (Player) event.getAttacker();
+        Player attacker = (Player) event.getDamager();
         Player victim = (Player) event.getEntity();
 
         if (attacker.hasPermission(adminPerm)) return;
