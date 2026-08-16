@@ -5,7 +5,6 @@ import org.bukkit.ChatColor;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.block.Block;
-import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
@@ -14,10 +13,15 @@ import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.entity.EntityResurrectEvent;
 import org.bukkit.event.entity.EntityShootBowEvent;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryCloseEvent;
+import org.bukkit.event.inventory.InventoryOpenEvent;
 import org.bukkit.event.player.AsyncPlayerChatEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerVelocityEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.util.Vector;
 
@@ -39,12 +43,17 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
     private final Map<UUID, Long> bowDrawTime = new HashMap<>();
     private final Map<UUID, Float> lastYaw = new HashMap<>();
     private final Map<UUID, Float> lastPitch = new HashMap<>();
-    private final Map<UUID, Long> lastVelocityTime = new HashMap<>();
+    
+    // New Advanced State Trackers
+    private final Set<UUID> openInventories = new HashSet<>();
+    private final Map<UUID, Vector> expectedVelocity = new HashMap<>();
+    private final Map<UUID, Long> velocityTime = new HashMap<>();
+    private final Map<UUID, Long> totemPopTime = new HashMap<>();
 
     @Override
     public void onEnable() {
         getServer().getPluginManager().registerEvents(this, this);
-        getLogger().info("[MeteorAntiCheat] Full Grim-Mapped Engine v3.0 online.");
+        getLogger().info("[MeteorAntiCheat] Enterprise Engine v4.0 (Full Protection) online.");
     }
 
     @Override
@@ -58,7 +67,7 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
 
     /*
      * ==========================================
-     * 1. SIMULATION, GROUND SPOOF & TIMER CHECKS
+     * 1. MOVEMENT, SIMULATION & WORLD EXPLOITS
      * ==========================================
      */
     @EventHandler
@@ -71,36 +80,51 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
         if (to == null || from.getWorld() == null || to.getWorld() == null) return;
 
         UUID uuid = player.getUniqueId();
-
-        // -- Simulation / Speed Check --
         double dXZ = Math.sqrt(Math.pow(to.getX() - from.getX(), 2) + Math.pow(to.getZ() - from.getZ(), 2));
         double dY = to.getY() - from.getY();
         double maxSpeed = 0.65 + (player.getPing() * 0.001);
 
+        // -- Simulation / Speed --
         if (dXZ > maxSpeed) {
             event.setTo(from);
-            handleViolation(player, "Simulation", "Speed", 2);
+            handleViolation(player, "Movement", "Speed", 2);
         }
 
-        // -- GroundSpoof / NoFall Check --
+        // -- GroundSpoof / NoFall --
         if (player.isOnGround() && from.getY() > to.getY()) {
             Block blockBelow = from.clone().subtract(0, 0.5, 0).getBlock();
             if (blockBelow.getType().isAir() && player.getFallDistance() > 2.0f) {
-                handleViolation(player, "Simulation", "GroundSpoof", 3);
+                handleViolation(player, "Movement", "GroundSpoof", 3);
             }
         }
 
-        // -- Timer & TimerLimit Check --
+        // -- Jesus (Water Walk) Check --
+        Material belowMat = from.clone().subtract(0, 0.1, 0).getBlock().getType();
+        Material atMat = from.getBlock().getType();
+        if ((belowMat == Material.WATER || belowMat == Material.LAVA) && atMat == Material.AIR) {
+            // If they are hovering perfectly on top of water without swimming/boating
+            if (dY == 0.0 && !player.isInsideVehicle() && !player.isSwimming()) {
+                handleViolation(player, "Movement", "Jesus", 3);
+            }
+        }
+
+        // -- InventoryMove Check --
+        if (openInventories.contains(uuid) && dXZ > 0.15 && player.getFallDistance() == 0 && !player.isInsideVehicle()) {
+            handleViolation(player, "Exploit", "InventoryMove", 2);
+            event.setTo(from); // Stop them from walking
+        }
+
+        // -- Timer & TimerLimit --
         long now = System.currentTimeMillis();
         long start = moveTime.getOrDefault(uuid, now);
         int packets = movePackets.getOrDefault(uuid, 0) + 1;
 
         if (now - start > 1000) {
             if (packets > 26 && !player.isInsideVehicle()) {
-                handleViolation(player, "Simulation", "Timer", 4);
+                handleViolation(player, "Movement", "Timer", 4);
                 event.setTo(from);
             } else if (packets < 15 && packets > 0 && !player.isInsideVehicle()) {
-                handleViolation(player, "Simulation", "TimerLimit", 2);
+                handleViolation(player, "Movement", "TimerLimit", 2);
             }
             moveTime.put(uuid, now);
             movePackets.put(uuid, 0);
@@ -108,33 +132,62 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
             movePackets.put(uuid, packets);
         }
 
+        // -- Velocity / Anti-Knockback Check --
+        if (expectedVelocity.containsKey(uuid)) {
+            long timeSinceVel = System.currentTimeMillis() - velocityTime.getOrDefault(uuid, 0L);
+            if (timeSinceVel < 500) {
+                Vector expected = expectedVelocity.get(uuid);
+                // If the server pushed them UP, but their client claims they didn't go up and stayed on the ground
+                if (expected.getY() > 0.1 && dY <= 0 && player.isOnGround()) {
+                    handleViolation(player, "Combat", "Velocity", 3);
+                    expectedVelocity.remove(uuid);
+                }
+            } else {
+                expectedVelocity.remove(uuid); // Expire old velocity data
+            }
+        }
+
         // -- Baritone / Aim Snapping Heuristics --
         float yawDelta = Math.abs(to.getYaw() - lastYaw.getOrDefault(uuid, to.getYaw()));
         float pitchDelta = Math.abs(to.getPitch() - lastPitch.getOrDefault(uuid, to.getPitch()));
         if (yawDelta > 60.0f && pitchDelta < 1.0f && dXZ > 0.2) {
-            handleViolation(player, "Combat", "Aim", 2); // Baritone linear pathfinding look snaps
+            handleViolation(player, "Combat", "Aim", 2);
         }
         lastYaw.put(uuid, to.getYaw());
         lastPitch.put(uuid, to.getPitch());
-
-        // -- Misc: Vehicle & Elytra Checks --
-        if (player.isInsideVehicle() && dY > 1.5) {
-            handleViolation(player, "Misc", "Vehicle", 3);
-        }
     }
 
     /*
      * ==========================================
-     * 2. COMBAT, REACH, HITBOXES & KNOCKBACK
+     * 2. COMBAT, KNOCKBACK & EXPLOITS
      * ==========================================
      */
+    @EventHandler
+    public void onVelocity(PlayerVelocityEvent event) {
+        Player player = event.getPlayer();
+        if (isBypassed(player)) return;
+        
+        // Log the velocity the server is TRYING to apply to the player
+        if (event.getVelocity().lengthSquared() > 0.1) {
+            expectedVelocity.put(player.getUniqueId(), event.getVelocity());
+            velocityTime.put(player.getUniqueId(), System.currentTimeMillis());
+        }
+    }
+
+    @EventHandler
+    public void onTotemPop(EntityResurrectEvent event) {
+        if (event.getEntity() instanceof Player) {
+            totemPopTime.put(event.getEntity().getUniqueId(), System.currentTimeMillis());
+        }
+    }
+
     @EventHandler
     public void onDamage(EntityDamageByEntityEvent event) {
         if (!(event.getDamager() instanceof Player)) return;
         Player attacker = (Player) event.getDamager();
         if (isBypassed(attacker)) return;
 
-        // -- Reach & Hitboxes Check --
+        // -- Reach & Hitboxes --
         if (event.getEntity() instanceof Player) {
             Player victim = (Player) event.getEntity();
             double distance = attacker.getLocation().distance(victim.getLocation());
@@ -142,44 +195,58 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
 
             if (distance > maxReach) {
                 event.setCancelled(true);
-                handleViolation(attacker, "Reach", "Reach", 3);
+                handleViolation(attacker, "Combat", "Reach", 3);
             } else if (distance > 3.0 && Math.abs(attacker.getLocation().getY() - victim.getLocation().getY()) > 2.5) {
                 event.setCancelled(true);
-                handleViolation(attacker, "Hitboxes", "Hitboxes", 3);
+                handleViolation(attacker, "Combat", "Hitboxes", 3);
             }
-        }
-
-        // Track damage for Knockback / Explosion velocity validation
-        lastVelocityTime.put(attacker.getUniqueId(), System.currentTimeMillis());
-    }
-
-    @EventHandler
-    public void onEntityDamage(EntityDamageEvent event) {
-        if (!(event.getEntity() instanceof Player)) return;
-        Player player = (Player) event.getEntity();
-        if (event.getCause() == EntityDamageEvent.DamageCause.ENTITY_EXPLOSION || event.getCause() == EntityDamageEvent.DamageCause.BLOCK_EXPLOSION) {
-            lastVelocityTime.put(player.getUniqueId(), System.currentTimeMillis());
         }
     }
 
     /*
      * ==========================================
-     * 3. MISC, NOSLOW, SPRINT, PLACE & BREAK
+     * 3. INVENTORY & PLAYER EXPLOITS
      * ==========================================
      */
+    @EventHandler
+    public void onInvOpen(InventoryOpenEvent event) {
+        openInventories.add(event.getPlayer().getUniqueId());
+    }
+
+    @EventHandler
+    public void onInvClose(InventoryCloseEvent event) {
+        openInventories.remove(event.getPlayer().getUniqueId());
+    }
+
+    @EventHandler
+    public void onInvClick(InventoryClickEvent event) {
+        if (!(event.getWhoClicked() instanceof Player)) return;
+        Player player = (Player) event.getWhoClicked();
+        if (isBypassed(player)) return;
+
+        // -- AutoTotem Heuristic --
+        // If they click a totem within 50 milliseconds of popping one, it is a macro.
+        if (event.getCurrentItem() != null && event.getCurrentItem().getType() == Material.TOTEM_OF_UNDYING) {
+            long timeSincePop = System.currentTimeMillis() - totemPopTime.getOrDefault(player.getUniqueId(), 0L);
+            if (timeSincePop > 0 && timeSincePop < 50) {
+                event.setCancelled(true);
+                handleViolation(player, "Exploit", "AutoTotem", 5);
+            }
+        }
+    }
+
     @EventHandler
     public void onInteract(PlayerInteractEvent event) {
         Player player = event.getPlayer();
         UUID uuid = player.getUniqueId();
 
-        // Bow Draw Tracking for FastBow
         if (event.getItem() != null && event.getItem().getType() == Material.BOW) {
             if (event.getAction() == Action.RIGHT_CLICK_AIR || event.getAction() == Action.RIGHT_CLICK_BLOCK) {
                 bowDrawTime.put(uuid, System.currentTimeMillis());
             }
         }
 
-        // -- Autoclicker Standard Deviation Check --
+        // -- Autoclicker --
         if (event.getAction() == Action.LEFT_CLICK_AIR || event.getAction() == Action.LEFT_CLICK_BLOCK) {
             if (isBypassed(player)) return;
 
@@ -197,7 +264,7 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
                     double stdDev = Math.sqrt(variance);
 
                     if (stdDev < 4.5 && mean < 90.0) {
-                        handleViolation(player, "Autoclicker", "Autoclicker", 3);
+                        handleViolation(player, "Combat", "Autoclicker", 3);
                     }
                     delays.clear();
                 }
@@ -206,33 +273,9 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
             lastClickTime.put(uuid, now);
         }
 
-        // -- NoSlow Check (Eating/Blocking while sprinting) --
+        // -- NoSlow Check --
         if (player.isSprinting() && player.isHandRaised()) {
-            handleViolation(player, "Misc", "NoSlow", 2);
-        }
-    }
-
-    @EventHandler
-    public void onBlockBreak(BlockBreakEvent event) {
-        Player player = event.getPlayer();
-        if (isBypassed(player)) return;
-
-        Block target = player.getTargetBlockExact(6);
-        if (target == null || !target.getLocation().equals(event.getBlock().getLocation())) {
-            event.setCancelled(true);
-            handleViolation(player, "Misc", "Break", 2); // Nuker/WallBreak
-        }
-    }
-
-    @EventHandler
-    public void onBlockPlace(BlockPlaceEvent event) {
-        Player player = event.getPlayer();
-        if (isBypassed(player)) return;
-
-        Block target = player.getTargetBlockExact(6);
-        if (target == null || player.getLocation().distance(event.getBlock().getLocation()) > 6.0) {
-            event.setCancelled(true);
-            handleViolation(player, "Misc", "Place", 2); // Scaffold / FastPlace
+            handleViolation(player, "Movement", "NoSlow", 2);
         }
     }
 
@@ -247,35 +290,13 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
 
         if (event.getForce() >= 0.95f && duration < 250 && drawStart != 0) {
             event.setCancelled(true);
-            handleViolation(player, "BadPackets", "PacketOrder", 3);
+            handleViolation(player, "Exploit", "FastBow", 3);
         }
     }
 
     /*
      * ==========================================
-     * 4. BAD PACKETS, CHAT & EXPLOITS
-     * ==========================================
-     */
-    @EventHandler
-    public void onChat(AsyncPlayerChatEvent event) {
-        Player player = event.getPlayer();
-        if (isBypassed(player)) return;
-
-        UUID uuid = player.getUniqueId();
-        long now = System.currentTimeMillis();
-
-        if (chatCooldown.containsKey(uuid) && now - chatCooldown.get(uuid) < 1200) {
-            event.setCancelled(true);
-            handleViolation(player, "Misc", "Chat", 1);
-            player.sendMessage(prefix + ChatColor.RED + "Chat packet rate limit exceeded.");
-            return;
-        }
-        chatCooldown.put(uuid, now);
-    }
-
-    /*
-     * ==========================================
-     * 5. CENTRALIZED PUNISHMENT & ALERT ENGINE
+     * 4. PUNISHMENT ROUTING
      * ==========================================
      */
     private void handleViolation(Player player, String category, String checkName, int vlAdd) {
@@ -284,20 +305,17 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener {
         int totalVL = catMap.getOrDefault(uuid, 0) + vlAdd;
         catMap.put(uuid, totalVL);
 
-        // Action routing modeled after Grim's config commands
         String action = "ALERT";
         if (totalVL >= 40) {
             action = "BAN";
             Bukkit.getScheduler().runTask(this, () -> player.kickPlayer("Security Violation: " + checkName));
-            catMap.put(uuid, 0); // Reset after action
+            catMap.put(uuid, 0); 
         }
 
-        // Console JSON Telemetry Logging
         String log = String.format("{\"category\": \"%s\", \"check\": \"%s\", \"player\": \"%s\", \"vl\": %d, \"action\": \"%s\"}",
                 category, checkName, player.getName(), totalVL, action);
         Bukkit.getConsoleSender().sendMessage(prefix + ChatColor.DARK_GRAY + log);
 
-        // Broadcast to Staff Ranks and OPs
         for (Player admin : Bukkit.getOnlinePlayers()) {
             if (admin.isOp() || 
                 admin.hasPermission("meteor.mod") || 
