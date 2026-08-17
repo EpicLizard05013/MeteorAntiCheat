@@ -49,6 +49,7 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
     
     // Advanced State & Client Trackers
     private final Set<UUID> openInventories = new HashSet<>();
+    private final Map<UUID, Long> inventoryOpenTime = new HashMap<>(); // Added for InventoryMove momentum grace period
     private final Map<UUID, Vector> expectedVelocity = new HashMap<>();
     private final Map<UUID, Long> velocityTime = new HashMap<>();
     private final Map<UUID, Long> totemPopTime = new HashMap<>();
@@ -57,9 +58,13 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
     // Auto Anchor Heuristics
     private final Map<UUID, Long> lastAnchorInteractTime = new HashMap<>();
     private final Map<UUID, Integer> anchorActionBuffer = new HashMap<>();
+    
+    // Movement Buffers
+    private final Map<UUID, Integer> jesusBuffer = new HashMap<>(); // Added to desensitize Jesus check
 
     // Control States
     private boolean testingMode = false;
+    private boolean anticheatEnabled = true; // Added for /meteorac disable
     private final Set<UUID> alertRecipients = new HashSet<>();
 
     @Override
@@ -77,7 +82,7 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
             getServer().getMessenger().registerIncomingPluginChannel(this, "MC|Brand", this);
         } catch (Exception ignored) {}
 
-        getLogger().info("[MeteorAntiCheat] Enterprise Engine v4.4 (AutoAnchor & Alert System Enabled) online.");
+        getLogger().info("[MeteorAntiCheat] Enterprise Engine v4.5 (AutoAnchor, Alert System & Toggles Enabled) online.");
     }
 
     @Override
@@ -90,6 +95,11 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
     }
 
     private boolean isBypassed(Player player) {
+        // If the entire anticheat is disabled via command, everyone bypasses checks
+        if (!anticheatEnabled) {
+            return true;
+        }
+        
         // If testing mode is active, owner bypasses, but opped staff / srmod can test checks.
         if (testingMode && (player.isOp() || player.hasPermission("meteor.srmod"))) {
             return false;
@@ -121,12 +131,50 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
             sender.sendMessage(ChatColor.WHITE + "/meteorac perms <player> - Toggle alert subscriptions for a player");
             sender.sendMessage(ChatColor.WHITE + "/meteorac test - Toggle global anti-cheat testing mode");
             sender.sendMessage(ChatColor.WHITE + "/meteorac logs <player> - View active violation records");
+            sender.sendMessage(ChatColor.WHITE + "/meteorac disable - Globally disable the anti-cheat engine");
+            sender.sendMessage(ChatColor.WHITE + "/meteorac enable - Globally enable the anti-cheat engine");
+            sender.sendMessage(ChatColor.WHITE + "/meteorac reload - Wipe heuristic data and violation caches");
             return true;
         }
 
         if (args[0].equalsIgnoreCase("test")) {
             testingMode = !testingMode;
             sender.sendMessage(prefix + ChatColor.YELLOW + "Testing Mode is now: " + (testingMode ? ChatColor.GREEN + "ENABLED (Staff can be flagged)" : ChatColor.RED + "DISABLED"));
+            return true;
+        }
+
+        if (args[0].equalsIgnoreCase("disable")) {
+            anticheatEnabled = false;
+            sender.sendMessage(prefix + ChatColor.RED + "AntiCheat engine has been globally disabled.");
+            return true;
+        }
+
+        if (args[0].equalsIgnoreCase("enable")) {
+            anticheatEnabled = true;
+            sender.sendMessage(prefix + ChatColor.GREEN + "AntiCheat engine has been globally enabled.");
+            return true;
+        }
+
+        if (args[0].equalsIgnoreCase("reload")) {
+            categoryViolations.clear();
+            clickDelays.clear();
+            lastClickTime.clear();
+            movePackets.clear();
+            moveTime.clear();
+            bowDrawTime.clear();
+            lastYaw.clear();
+            lastPitch.clear();
+            aimBuffer.clear();
+            openInventories.clear();
+            inventoryOpenTime.clear();
+            expectedVelocity.clear();
+            velocityTime.clear();
+            totemPopTime.clear();
+            lastAnchorInteractTime.clear();
+            anchorActionBuffer.clear();
+            jesusBuffer.clear();
+            
+            sender.sendMessage(prefix + ChatColor.GREEN + "All heuristic state data, movement buffers, and active violations have been reloaded.");
             return true;
         }
 
@@ -249,25 +297,61 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
 
         // -- GroundSpoof / NoFall --
         if (player.isOnGround() && from.getY() > to.getY()) {
-            Block blockBelow = from.clone().subtract(0, 0.5, 0).getBlock();
-            if (blockBelow.getType().isAir() && player.getFallDistance() > 2.0f) {
-                handleViolation(player, "Movement", "GroundSpoof", 3);
+            if (player.getFallDistance() > 2.0f) {
+                boolean hasSolidBlockBelow = false;
+                
+                // A player's bounding box is 0.6 blocks wide. 
+                // We check the 4 corners around their center to see if ANY part of them is resting on a block.
+                double[] offsets = {-0.3, 0.3};
+                
+                for (double xOff : offsets) {
+                    for (double zOff : offsets) {
+                        Block b = from.clone().add(xOff, -0.5, zOff).getBlock();
+                        if (!b.getType().isAir()) {
+                            hasSolidBlockBelow = true;
+                            break; // Found a block, they aren't spoofing
+                        }
+                    }
+                    if (hasSolidBlockBelow) break;
+                }
+
+                if (!hasSolidBlockBelow) {
+                    handleViolation(player, "Movement", "GroundSpoof", 3);
+                }
             }
         }
 
-        // -- Jesus (Water Walk) Check --
+        // -- Jesus (Water Walk) Check (Desensitized) --
         Material belowMat = from.clone().subtract(0, 0.1, 0).getBlock().getType();
         Material atMat = from.getBlock().getType();
+        
         if ((belowMat == Material.WATER || belowMat == Material.LAVA) && atMat == Material.AIR) {
-            if (dY == 0.0 && !player.isInsideVehicle() && !player.isSwimming()) {
-                handleViolation(player, "Movement", "Jesus", 3);
+            // Player Y-axis must be extremely stable, they can't be swimming or flying naturally
+            if (Math.abs(dY) < 0.05 && !player.isInsideVehicle() && !player.isSwimming() && !player.isFlying()) {
+                int buffer = jesusBuffer.getOrDefault(uuid, 0) + 1;
+                jesusBuffer.put(uuid, buffer);
+                
+                // Require them to be "hovering" for at least 6 consecutive ticks to bypass lily-pad bobbing
+                if (buffer >= 6) {
+                    handleViolation(player, "Movement", "Jesus", 3);
+                }
+            } else {
+                jesusBuffer.put(uuid, Math.max(0, jesusBuffer.getOrDefault(uuid, 0) - 1)); // Decay slightly to catch fast bobs
             }
+        } else {
+            jesusBuffer.put(uuid, 0); // Reset buffer entirely if they touch solid blocks
         }
 
-        // -- InventoryMove Check --
-        if (openInventories.contains(uuid) && dXZ > 0.15 && player.getFallDistance() == 0 && !player.isInsideVehicle()) {
-            handleViolation(player, "Exploit", "InventoryMove", 2);
-            event.setTo(from);
+        // -- InventoryMove Check (Desensitized) --
+        if (openInventories.contains(uuid) && dXZ > 0.15 && !player.isInsideVehicle()) {
+            long timeOpened = inventoryOpenTime.getOrDefault(uuid, System.currentTimeMillis());
+            long timeSinceOpen = System.currentTimeMillis() - timeOpened;
+            
+            // Allow 600ms grace period for momentum to carry out after opening inventory
+            if (timeSinceOpen > 600 && player.getFallDistance() == 0) {
+                handleViolation(player, "Exploit", "InventoryMove", 2);
+                event.setTo(from);
+            }
         }
 
         // -- Timer & TimerLimit --
@@ -376,7 +460,9 @@ public final class MeteorAntiCheat extends JavaPlugin implements Listener, Plugi
      */
     @EventHandler
     public void onInvOpen(InventoryOpenEvent event) {
-        openInventories.add(event.getPlayer().getUniqueId());
+        UUID uuid = event.getPlayer().getUniqueId();
+        openInventories.add(uuid);
+        inventoryOpenTime.put(uuid, System.currentTimeMillis());
     }
 
     @EventHandler
